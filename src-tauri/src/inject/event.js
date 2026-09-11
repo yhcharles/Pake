@@ -1356,10 +1356,22 @@ document.addEventListener("DOMContentLoaded", () => {
     if (pendingFocusClick?.id === id) pendingFocusClick = null;
   };
 
+  // Withdraw the delivered notification as well. macOS keeps a notification in
+  // Notification Center until it is explicitly removed, so a page that closes
+  // its own notifications (after the message is read elsewhere) would otherwise
+  // leave them piling up -- and with several Pake windows, every window raises
+  // its own copy of the same message.
+  const dismissNotification = (id) => {
+    forgetNotification(id);
+    invoke("close_notification", { id }).catch(() => {});
+  };
+
   const clickNotification = (id) => {
     const notif = liveNotifications.get(id);
     if (!notif) return;
     pendingFocusClick = null;
+    // The platform removes an activated notification itself; just stop tracking.
+    forgetNotification(id);
     notif.dispatchEvent(new Event("click"));
   };
 
@@ -1413,11 +1425,12 @@ document.addEventListener("DOMContentLoaded", () => {
       const id = `pake-${++notifSeq}-${Math.random().toString(36).slice(2, 10)}`;
       Object.defineProperty(this, "_id", { value: id, enumerable: false });
 
-      // A new notification with the same tag replaces the previous one, which
-      // must therefore stop being a click target.
+      // A new notification with the same tag replaces the previous one, so the
+      // old one must be withdrawn rather than left on screen. Replacement is
+      // not a close, so the old instance gets no close event.
       if (this.tag) {
         for (const [otherId, other] of liveNotifications) {
-          if (other.tag === this.tag) forgetNotification(otherId);
+          if (other.tag === this.tag) dismissNotification(otherId);
         }
       }
       liveNotifications.set(id, this);
@@ -1432,6 +1445,13 @@ document.addEventListener("DOMContentLoaded", () => {
         params: { id, title: this.title, body: this.body, icon: this.icon },
       })
         .then((outcome) => {
+          // Another window already raised this exact message, so nothing was
+          // shown: no click can arrive, and counting it would double the badge
+          // once per extra window.
+          if (outcome?.suppressed) {
+            forgetNotification(id);
+            return undefined;
+          }
           if (raisedInBackground && !outcome?.nativeClick) {
             pendingFocusClick = { id, at: Date.now() };
           }
@@ -1445,7 +1465,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     close() {
-      forgetNotification(this._id);
+      dismissNotification(this._id);
       this.dispatchEvent(new Event("close"));
     }
   }

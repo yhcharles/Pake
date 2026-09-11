@@ -27,8 +27,9 @@ const GDK_BACKEND: &str = "GDK_BACKEND";
 
 use app::{
     invoke::{
-        clear_dock_badge, download_file, increment_dock_badge, send_notification, set_dock_badge,
-        set_dock_badge_label, set_zoom, update_theme_mode, webview_navigate,
+        clear_dock_badge, close_notification, download_file, increment_dock_badge,
+        send_notification, set_dock_badge, set_dock_badge_label, set_zoom, update_theme_mode,
+        webview_navigate,
     },
     setup::{set_global_shortcut, set_system_tray},
     window::{
@@ -294,6 +295,7 @@ pub fn run_app() {
         .invoke_handler(tauri::generate_handler![
             download_file,
             send_notification,
+            close_notification,
             increment_dock_badge,
             set_dock_badge,
             set_dock_badge_label,

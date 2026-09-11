@@ -23,6 +23,7 @@ function createElement(tagName = "div") {
 function loadNotificationBridge({
   nativeClick = false,
   hasFocus = false,
+  suppressed = false,
 } = {}) {
   const source = ["link_policy.js", "event.js"]
     .map((file) =>
@@ -75,7 +76,7 @@ function loadNotificationBridge({
           invoke: (command, payload) => {
             invokeCalls.push({ command, payload });
             if (command === "send_notification") {
-              return Promise.resolve({ nativeClick });
+              return Promise.resolve({ nativeClick, suppressed });
             }
             return Promise.resolve();
           },
@@ -277,6 +278,106 @@ describe("notification bridge", () => {
 
     expect(closeHandler).toHaveBeenCalledTimes(1);
     expect(clickHandler).not.toHaveBeenCalled();
+  });
+
+  it("withdraws the delivered notification when the page closes it", async () => {
+    const bridge = loadNotificationBridge({ nativeClick: true });
+    const notif = new bridge.Notification("Ann");
+    await bridge.settle();
+    const { id } = bridge.invokeCalls[0].payload.params;
+
+    notif.close();
+
+    expect(bridge.invokeCalls).toContainEqual({
+      command: "close_notification",
+      payload: { id },
+    });
+  });
+
+  it("withdraws the notification a reused tag replaced", async () => {
+    const bridge = loadNotificationBridge({ nativeClick: true });
+    new bridge.Notification("Ann", { tag: "dm-ann" });
+    await bridge.settle();
+    const olderId = bridge.invokeCalls[0].payload.params.id;
+
+    new bridge.Notification("Ann again", { tag: "dm-ann" });
+    await bridge.settle();
+
+    expect(bridge.invokeCalls).toContainEqual({
+      command: "close_notification",
+      payload: { id: olderId },
+    });
+  });
+
+  it("does not withdraw a notification the platform already cleared on click", async () => {
+    const bridge = loadNotificationBridge({ nativeClick: true });
+    new bridge.Notification("Ann");
+    await bridge.settle();
+    const { id } = bridge.invokeCalls[0].payload.params;
+
+    bridge.notificationClick(id);
+
+    expect(bridge.invokeCalls).not.toContainEqual({
+      command: "close_notification",
+      payload: { id },
+    });
+  });
+
+  it("stops tracking a notification another window already raised", async () => {
+    const bridge = loadNotificationBridge({
+      nativeClick: true,
+      suppressed: true,
+    });
+    const notif = new bridge.Notification("Ann");
+    const clickHandler = vi.fn();
+    const showHandler = vi.fn();
+    notif.onclick = clickHandler;
+    notif.onshow = showHandler;
+    await bridge.settle();
+
+    const { id } = bridge.invokeCalls[0].payload.params;
+    bridge.notificationClick(id);
+
+    expect(clickHandler).not.toHaveBeenCalled();
+    expect(showHandler).not.toHaveBeenCalled();
+  });
+
+  it("does not count a suppressed notification towards the badge", async () => {
+    const bridge = loadNotificationBridge({
+      nativeClick: true,
+      suppressed: true,
+    });
+    new bridge.Notification("Ann");
+    await bridge.settle();
+
+    expect(bridge.invokeCalls.map(({ command }) => command)).not.toContain(
+      "increment_dock_badge",
+    );
+  });
+
+  it("counts a delivered notification towards the badge", async () => {
+    const bridge = loadNotificationBridge({ nativeClick: true });
+    new bridge.Notification("Ann");
+    await bridge.settle();
+
+    expect(bridge.invokeCalls.map(({ command }) => command)).toContain(
+      "increment_dock_badge",
+    );
+  });
+
+  it("does not arm the focus fallback for a suppressed notification", async () => {
+    const bridge = loadNotificationBridge({
+      nativeClick: false,
+      suppressed: true,
+    });
+    const notif = new bridge.Notification("Ann");
+    const handler = vi.fn();
+    notif.onclick = handler;
+    await bridge.settle();
+
+    bridge.focusWindow();
+
+    expect(handler).not.toHaveBeenCalled();
   });
 
   it("exposes the standard permission surface", async () => {

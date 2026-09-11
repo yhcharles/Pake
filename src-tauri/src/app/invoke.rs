@@ -200,6 +200,13 @@ pub fn send_notification(
     notification::send(&app, &window, &params)
 }
 
+/// Withdraw a notification the page closed. Scoped to the calling window so one
+/// window cannot dismiss another window's notifications.
+#[command]
+pub fn close_notification(app: AppHandle, window: WebviewWindow, id: String) -> Result<(), String> {
+    notification::close(&app, &window, &id)
+}
+
 #[command]
 pub fn set_dock_badge(app: AppHandle, count: Option<i64>) -> Result<(), String> {
     let normalized = normalize_badge_count(count);
