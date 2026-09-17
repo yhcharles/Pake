@@ -323,7 +323,10 @@ describe("notification bridge", () => {
     });
   });
 
-  it("stops tracking a notification another window already raised", async () => {
+  it("keeps a suppressed notification clickable so it can be rerouted here", async () => {
+    // The window showing the banner may not be the window that should handle
+    // the click, so Rust reroutes it to this one -- which only works if this
+    // notification is still addressable.
     const bridge = loadNotificationBridge({
       nativeClick: true,
       suppressed: true,
@@ -338,7 +341,8 @@ describe("notification bridge", () => {
     const { id } = bridge.invokeCalls[0].payload.params;
     bridge.notificationClick(id);
 
-    expect(clickHandler).not.toHaveBeenCalled();
+    expect(clickHandler).toHaveBeenCalledTimes(1);
+    // It was never displayed, so it reports no show.
     expect(showHandler).not.toHaveBeenCalled();
   });
 

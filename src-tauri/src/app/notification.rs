@@ -24,15 +24,21 @@ const MAX_NOTIFICATION_ID_LEN: usize = 64;
 /// this only needs to absorb ordinary scheduling jitter, and staying tight keeps
 /// a genuinely repeated message from being swallowed.
 const DEDUPE_WINDOW: Duration = Duration::from_secs(1);
-const MAX_DEDUPE_ENTRIES: usize = 64;
+const MAX_TRACKED_MESSAGES: usize = 64;
 
-struct DedupeEntry {
+/// One incoming message, and the notification each window raised for it.
+struct MessageGroup {
     key: String,
-    window_label: String,
+    /// When the message was first seen, for the repeat window only. Membership
+    /// itself outlives that: a click can land minutes after delivery.
     at: Instant,
+    /// `(window label, notification id)` in arrival order. The first entry is
+    /// the notification that was actually delivered; the rest were suppressed.
+    members: Vec<(String, String)>,
 }
 
-/// Collapses the copies of one message that `--multi-window` produces.
+/// Collapses the copies of one message that `--multi-window` produces, and
+/// remembers them so a click can be routed to a window of our choosing.
 ///
 /// Every Pake window runs its own instance of the site, so a single incoming
 /// message raises one notification per window, all identical and all competing
@@ -40,50 +46,90 @@ struct DedupeEntry {
 /// counts as a duplicate, so a site legitimately repeating a message within one
 /// window still gets every notification.
 #[derive(Default)]
-struct Dedupe {
-    entries: Vec<DedupeEntry>,
+struct MessageRegistry {
+    groups: Vec<MessageGroup>,
 }
 
-impl Dedupe {
-    fn is_repeat(&mut self, window_label: &str, key: String, now: Instant) -> bool {
-        self.entries
-            .retain(|entry| now.duration_since(entry.at) < DEDUPE_WINDOW);
+impl MessageRegistry {
+    /// Records a notification and reports whether it should be suppressed
+    /// because another window already raised the same message.
+    fn record(&mut self, window_label: &str, id: &str, key: String, now: Instant) -> bool {
+        let member = (window_label.to_string(), id.to_string());
 
-        if self
-            .entries
-            .iter()
-            .any(|entry| entry.key == key && entry.window_label != window_label)
-        {
+        // Only a group inside the repeat window that this window has not
+        // contributed to yet absorbs the notification. A window repeating a
+        // message to itself therefore starts a new group and is delivered.
+        let existing = self.groups.iter_mut().find(|group| {
+            group.key == key
+                && now.duration_since(group.at) < DEDUPE_WINDOW
+                && !group.members.iter().any(|(w, _)| w == window_label)
+        });
+
+        if let Some(group) = existing {
+            group.members.push(member);
             return true;
         }
 
-        if self.entries.len() >= MAX_DEDUPE_ENTRIES {
-            self.entries.remove(0);
+        if self.groups.len() >= MAX_TRACKED_MESSAGES {
+            self.groups.remove(0);
         }
-        self.entries.push(DedupeEntry {
+        self.groups.push(MessageGroup {
             key,
-            window_label: window_label.to_string(),
             at: now,
+            members: vec![member],
         });
         false
     }
+
+    /// The notification `preferred_label` raised for the same message.
+    ///
+    /// `None` when that window never raised it -- it may have been opened after
+    /// the message arrived, or still be loading -- in which case the caller
+    /// keeps the click on the window that raised the clicked notification
+    /// rather than dropping it.
+    fn sibling_in(
+        &self,
+        window_label: &str,
+        id: &str,
+        preferred_label: &str,
+    ) -> Option<(String, String)> {
+        if window_label == preferred_label {
+            return None;
+        }
+        self.groups
+            .iter()
+            .find(|group| {
+                group
+                    .members
+                    .iter()
+                    .any(|(w, i)| w == window_label && i == id)
+            })?
+            .members
+            .iter()
+            .find(|(w, _)| w == preferred_label)
+            .cloned()
+    }
 }
 
-static DEDUPE: Mutex<Dedupe> = Mutex::new(Dedupe {
-    entries: Vec::new(),
-});
+static REGISTRY: Mutex<MessageRegistry> = Mutex::new(MessageRegistry { groups: Vec::new() });
 
 /// Unit separator keeps a title ending in the body's prefix from colliding.
 fn dedupe_key(title: &str, body: &str) -> String {
     format!("{title}\u{1f}{body}")
 }
 
-fn is_cross_window_repeat(window_label: &str, title: &str, body: &str) -> bool {
+// A poisoned lock only means some earlier caller panicked mid-update; the worst
+// case here is a stale entry, never a reason to drop or misroute a notification.
+fn is_cross_window_repeat(window_label: &str, id: &str, title: &str, body: &str) -> bool {
     let key = dedupe_key(title, body);
-    // A poisoned lock only means some earlier caller panicked mid-update; the
-    // worst case here is a stale entry, never a reason to drop a notification.
-    let mut dedupe = DEDUPE.lock().unwrap_or_else(|e| e.into_inner());
-    dedupe.is_repeat(window_label, key, Instant::now())
+    let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    registry.record(window_label, id, key, Instant::now())
+}
+
+#[cfg(target_os = "macos")]
+fn sibling_in(window_label: &str, id: &str, preferred_label: &str) -> Option<(String, String)> {
+    let registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    registry.sibling_in(window_label, id, preferred_label)
 }
 
 #[derive(serde::Deserialize)]
@@ -102,8 +148,10 @@ pub struct NotificationOutcome {
     /// switch never fires a phantom click on the newest notification.
     native_click: bool,
     /// True when another window already raised this exact message, so nothing
-    /// was shown. The page must stop tracking the notification: no click can
-    /// ever arrive for it, and it must not inflate the badge count either.
+    /// was shown here. The page keeps the notification addressable -- a click
+    /// on the window that did show it can be rerouted to this one -- but must
+    /// not report a show event or count it towards the badge, which would
+    /// otherwise multiply by the number of windows.
     suppressed: bool,
 }
 
@@ -138,7 +186,7 @@ pub fn send(
 ) -> Result<NotificationOutcome, String> {
     validate_id(&params.id)?;
 
-    if is_cross_window_repeat(window.label(), &params.title, &params.body) {
+    if is_cross_window_repeat(window.label(), &params.id, &params.title, &params.body) {
         return Ok(NotificationOutcome {
             native_click: false,
             suppressed: true,
@@ -187,7 +235,14 @@ pub fn close(app: &AppHandle, window: &WebviewWindow, id: &str) -> Result<(), St
     Ok(())
 }
 
-/// Reveal the window the notification came from and hand the click to the page.
+/// Reveal the window that should handle the click and hand it to the page.
+///
+/// With `--multi-window` the notification could have come from any window, so
+/// the click is steered to the tab the user is actually looking at -- resolved
+/// now, at click time, because they may have switched tabs since the
+/// notification arrived. That only works when the target also raised the
+/// message (it has its own Notification object for it); otherwise the click
+/// stays with the window that raised the clicked notification.
 ///
 /// A hidden or minimized window is exactly the case where a notification click
 /// matters most, so this goes through the same show + `reapply_window_icon` +
@@ -196,7 +251,12 @@ pub fn close(app: &AppHandle, window: &WebviewWindow, id: &str) -> Result<(), St
 fn dispatch_click(app: &AppHandle, window_label: &str, id: &str) {
     use tauri::Manager;
 
-    let Some(window) = app.get_webview_window(window_label) else {
+    let (target_label, target_id) = macos::preferred_click_target(app, window_label)
+        .and_then(|preferred| sibling_in(window_label, id, &preferred))
+        .filter(|(label, _)| app.get_webview_window(label).is_some())
+        .unwrap_or_else(|| (window_label.to_string(), id.to_string()));
+
+    let Some(window) = app.get_webview_window(&target_label) else {
         return;
     };
 
@@ -205,9 +265,9 @@ fn dispatch_click(app: &AppHandle, window_label: &str, id: &str) {
     crate::app::window::reapply_window_icon(&window);
     let _ = window.set_focus();
 
-    // `id` passed `validate_id`, so it cannot break out of the string literal.
+    // `target_id` passed `validate_id`, so it cannot break out of the literal.
     let _ = window.eval(format!(
-        "window.__pakeNotificationClick && window.__pakeNotificationClick('{id}')"
+        "window.__pakeNotificationClick && window.__pakeNotificationClick('{target_id}')"
     ));
 }
 
@@ -224,6 +284,7 @@ mod macos {
     use objc2::rc::Retained;
     use objc2::runtime::{AnyClass, ProtocolObject};
     use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
+    use objc2_app_kit::NSWindow;
     use objc2_foundation::{
         NSObject, NSObjectProtocol, NSString, NSUserNotification, NSUserNotificationCenter,
         NSUserNotificationCenterDelegate,
@@ -327,6 +388,43 @@ mod macos {
         NATIVE_CLICK_READY.store(true, Ordering::SeqCst);
     }
 
+    /// Label of the window the user is currently looking at.
+    ///
+    /// `NSWindowTabGroup::selectedWindow` is the tab on screen, which is what a
+    /// notification click should land in, and it is read at click time so
+    /// switching or reordering tabs after the notification arrived is accounted
+    /// for. It does not depend on Pake being frontmost, so it still resolves
+    /// while the user is in another app.
+    ///
+    /// Windows outside a tab group fall back to whichever one holds focus.
+    /// `None` means the caller keeps its existing behaviour.
+    pub fn preferred_click_target(app: &AppHandle, origin_label: &str) -> Option<String> {
+        use tauri::Manager;
+
+        MainThreadMarker::new()?;
+
+        let windows = app.webview_windows();
+        let label_of = |target: *const NSWindow| {
+            windows.iter().find_map(|(label, window)| {
+                let ptr = window.ns_window().ok()? as *const NSWindow;
+                (ptr == target).then(|| label.clone())
+            })
+        };
+
+        let origin_ns = windows.get(origin_label)?.ns_window().ok()? as *mut NSWindow;
+        // SAFETY: Tauri hands back the window's live NSWindow, and this runs on
+        // the main thread, where AppKit window state may be read.
+        if let Some(group) = unsafe { (*origin_ns).tabGroup() } {
+            if let Some(selected) = group.selectedWindow() {
+                return label_of(Retained::as_ptr(&selected));
+            }
+        }
+
+        windows
+            .iter()
+            .find_map(|(label, window)| window.is_focused().ok()?.then(|| label.clone()))
+    }
+
     /// Returns whether the notification was handed to the native center. `false`
     /// means the caller should fall back to the plugin path.
     pub fn deliver(
@@ -393,8 +491,13 @@ mod macos {
 
 #[cfg(test)]
 mod tests {
-    use super::{dedupe_key, validate_id, Dedupe, DEDUPE_WINDOW};
+    use super::{dedupe_key, validate_id, MessageRegistry, DEDUPE_WINDOW};
     use std::time::{Duration, Instant};
+
+    /// `record` returns "was suppressed", so `false` means it got delivered.
+    fn deliver(registry: &mut MessageRegistry, window: &str, id: &str, at: Instant) -> bool {
+        !registry.record(window, id, dedupe_key("Ann", "hi"), at)
+    }
 
     #[test]
     fn accepts_generated_ids() {
@@ -412,48 +515,118 @@ mod tests {
 
     #[test]
     fn collapses_the_same_message_from_another_window() {
-        let mut dedupe = Dedupe::default();
+        let mut registry = MessageRegistry::default();
         let now = Instant::now();
-        let key = || dedupe_key("Ann", "hi");
 
-        assert!(!dedupe.is_repeat("pake", key(), now));
-        assert!(dedupe.is_repeat("pake-1", key(), now));
-        assert!(dedupe.is_repeat("pake-2", key(), now));
+        assert!(deliver(&mut registry, "pake", "a", now));
+        assert!(!deliver(&mut registry, "pake-1", "b", now));
+        assert!(!deliver(&mut registry, "pake-2", "c", now));
     }
 
     #[test]
     fn keeps_a_message_the_same_window_repeats() {
-        let mut dedupe = Dedupe::default();
+        let mut registry = MessageRegistry::default();
         let now = Instant::now();
-        let key = || dedupe_key("Ann", "hi");
 
-        assert!(!dedupe.is_repeat("pake", key(), now));
-        assert!(!dedupe.is_repeat("pake", key(), now));
+        assert!(deliver(&mut registry, "pake", "a", now));
+        assert!(deliver(&mut registry, "pake", "b", now));
     }
 
     #[test]
     fn keeps_a_different_message_from_another_window() {
-        let mut dedupe = Dedupe::default();
+        let mut registry = MessageRegistry::default();
         let now = Instant::now();
 
-        assert!(!dedupe.is_repeat("pake", dedupe_key("Ann", "hi"), now));
-        assert!(!dedupe.is_repeat("pake-1", dedupe_key("Bo", "hi"), now));
-        assert!(!dedupe.is_repeat("pake-1", dedupe_key("Ann", "bye"), now));
+        assert!(!registry.record("pake", "a", dedupe_key("Ann", "hi"), now));
+        assert!(!registry.record("pake-1", "b", dedupe_key("Bo", "hi"), now));
+        assert!(!registry.record("pake-1", "c", dedupe_key("Ann", "bye"), now));
     }
 
     #[test]
     fn stops_collapsing_once_the_window_has_passed() {
-        let mut dedupe = Dedupe::default();
+        let mut registry = MessageRegistry::default();
         let now = Instant::now();
         let later = now + DEDUPE_WINDOW + Duration::from_millis(1);
-        let key = || dedupe_key("Ann", "hi");
 
-        assert!(!dedupe.is_repeat("pake", key(), now));
-        assert!(!dedupe.is_repeat("pake-1", key(), later));
+        assert!(deliver(&mut registry, "pake", "a", now));
+        assert!(deliver(&mut registry, "pake-1", "b", later));
     }
 
     #[test]
     fn separates_title_and_body_so_they_cannot_run_together() {
         assert_ne!(dedupe_key("ab", "c"), dedupe_key("a", "bc"));
+    }
+
+    #[test]
+    fn reroutes_a_click_to_the_preferred_window() {
+        let mut registry = MessageRegistry::default();
+        let now = Instant::now();
+        deliver(&mut registry, "pake-1", "delivered", now);
+        deliver(&mut registry, "pake", "suppressed", now);
+
+        // Clicking pake-1's banner hands the click to pake's own notification.
+        assert_eq!(
+            registry.sibling_in("pake-1", "delivered", "pake"),
+            Some(("pake".to_string(), "suppressed".to_string()))
+        );
+    }
+
+    #[test]
+    fn does_not_reroute_when_already_on_the_preferred_window() {
+        let mut registry = MessageRegistry::default();
+        let now = Instant::now();
+        deliver(&mut registry, "pake", "delivered", now);
+        deliver(&mut registry, "pake-1", "suppressed", now);
+
+        assert_eq!(registry.sibling_in("pake", "delivered", "pake"), None);
+    }
+
+    #[test]
+    fn does_not_reroute_when_the_preferred_window_missed_the_message() {
+        let mut registry = MessageRegistry::default();
+        let now = Instant::now();
+        deliver(&mut registry, "pake-1", "delivered", now);
+
+        // pake-2 opened later and never raised this message, so the click has
+        // to stay with pake-1 rather than vanish.
+        assert_eq!(registry.sibling_in("pake-1", "delivered", "pake-2"), None);
+    }
+
+    #[test]
+    fn keeps_routing_after_the_dedupe_window_expires() {
+        let mut registry = MessageRegistry::default();
+        let now = Instant::now();
+        deliver(&mut registry, "pake-1", "delivered", now);
+        deliver(&mut registry, "pake", "suppressed", now);
+
+        // Membership must outlive the repeat window: a click can land minutes
+        // after the notification was delivered.
+        let _ = deliver(
+            &mut registry,
+            "pake-1",
+            "later",
+            now + DEDUPE_WINDOW + Duration::from_secs(60),
+        );
+        assert_eq!(
+            registry.sibling_in("pake-1", "delivered", "pake"),
+            Some(("pake".to_string(), "suppressed".to_string()))
+        );
+    }
+
+    #[test]
+    fn does_not_confuse_two_messages_with_the_same_text() {
+        let mut registry = MessageRegistry::default();
+        let now = Instant::now();
+        deliver(&mut registry, "pake-1", "first-a", now);
+        deliver(&mut registry, "pake", "first-b", now);
+
+        let later = now + DEDUPE_WINDOW + Duration::from_millis(1);
+        deliver(&mut registry, "pake-1", "second-a", later);
+        deliver(&mut registry, "pake", "second-b", later);
+
+        assert_eq!(
+            registry.sibling_in("pake-1", "second-a", "pake"),
+            Some(("pake".to_string(), "second-b".to_string()))
+        );
     }
 }

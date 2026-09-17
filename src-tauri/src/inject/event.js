@@ -1445,13 +1445,12 @@ document.addEventListener("DOMContentLoaded", () => {
         params: { id, title: this.title, body: this.body, icon: this.icon },
       })
         .then((outcome) => {
-          // Another window already raised this exact message, so nothing was
-          // shown: no click can arrive, and counting it would double the badge
-          // once per extra window.
-          if (outcome?.suppressed) {
-            forgetNotification(id);
-            return undefined;
-          }
+          // Another window is showing this message. Stay addressable: a click
+          // on that window's banner is rerouted here when this window is the
+          // one that should handle it. But it was never displayed, so it gets
+          // no show event, no focus fallback, and no badge count -- otherwise
+          // the badge would multiply by the number of windows.
+          if (outcome?.suppressed) return undefined;
           if (raisedInBackground && !outcome?.nativeClick) {
             pendingFocusClick = { id, at: Date.now() };
           }
