@@ -235,39 +235,61 @@ pub fn close(app: &AppHandle, window: &WebviewWindow, id: &str) -> Result<(), St
     Ok(())
 }
 
-/// Reveal the window that should handle the click and hand it to the page.
+/// Hand a notification click to the right window.
 ///
-/// With `--multi-window` the notification could have come from any window, so
-/// the click is steered to the tab the user is actually looking at -- resolved
-/// now, at click time, because they may have switched tabs since the
-/// notification arrived. That only works when the target also raised the
-/// message (it has its own Notification object for it); otherwise the click
-/// stays with the window that raised the clicked notification.
+/// With `--multi-window` every window runs its own instance of the site, so the
+/// notification could have come from any of them. The click is steered to the
+/// tab the user is actually looking at -- resolved at click time, since they may
+/// have switched tabs since it arrived -- but only when that tab also raised the
+/// message. Routing means dispatching to the site's own Notification object,
+/// and only the window that created one has the conversation to jump to.
 ///
-/// A hidden or minimized window is exactly the case where a notification click
-/// matters most, so this goes through the same show + `reapply_window_icon` +
-/// focus sequence as every other hidden-to-visible path (#1323).
+/// A visible tab with no notification for the message has almost always gone
+/// quiet precisely because it is already showing that conversation: chat sites
+/// do not notify about a message the user can see. The message is then already
+/// in front of the user, so pulling a background tab over the one they are
+/// working in would be the wrong answer, and this does nothing instead. The
+/// cost is that a visible tab which genuinely missed the message (still
+/// loading, say) makes the click look inert.
 #[cfg(target_os = "macos")]
 fn dispatch_click(app: &AppHandle, window_label: &str, id: &str) {
     use tauri::Manager;
 
-    let (target_label, target_id) = macos::preferred_click_target(app, window_label)
-        .and_then(|preferred| sibling_in(window_label, id, &preferred))
-        .filter(|(label, _)| app.get_webview_window(label).is_some())
-        .unwrap_or_else(|| (window_label.to_string(), id.to_string()));
+    let visible = macos::preferred_click_target(app, window_label);
 
-    let Some(window) = app.get_webview_window(&target_label) else {
-        return;
-    };
+    if let Some(visible_label) = visible.as_deref().filter(|label| *label != window_label) {
+        if let Some((label, sibling_id)) = sibling_in(window_label, id, visible_label) {
+            if let Some(window) = app.get_webview_window(&label) {
+                reveal_and_deliver(&window, &sibling_id);
+                return;
+            }
+        }
 
+        // Leave the user on the tab they are working in.
+        if app.get_webview_window(visible_label).is_some() {
+            return;
+        }
+    }
+
+    // Single window, or the notification belongs to the visible tab already.
+    if let Some(window) = app.get_webview_window(window_label) {
+        reveal_and_deliver(&window, id);
+    }
+}
+
+/// A hidden or minimized window is exactly the case where a notification click
+/// matters most, so this goes through the same show + `reapply_window_icon` +
+/// focus sequence as every other hidden-to-visible path (#1323).
+#[cfg(target_os = "macos")]
+fn reveal_and_deliver(window: &WebviewWindow, id: &str) {
     let _ = window.unminimize();
     let _ = window.show();
-    crate::app::window::reapply_window_icon(&window);
+    crate::app::window::reapply_window_icon(window);
     let _ = window.set_focus();
 
-    // `target_id` passed `validate_id`, so it cannot break out of the literal.
+    // `id` passed `validate_id`, so it cannot break out of the string literal.
     let _ = window.eval(format!(
-        "window.__pakeNotificationClick && window.__pakeNotificationClick('{target_id}')"
+        "window.__pakeNotificationClick && window.__pakeNotificationClick('{id}')"
     ));
 }
 
